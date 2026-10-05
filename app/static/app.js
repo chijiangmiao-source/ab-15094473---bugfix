@@ -76,6 +76,44 @@ const EXAMPLES = {
       "commit I1"
     ].join("\n")
   },
+  "违规：重取后旧执行写回冒名": {
+    program: [
+      "ADD R1,R0,R0",
+      "BEQ R1,R0 predict=taken",
+      "ADD R2,R1,R0"
+    ].join("\n"),
+    events: [
+      "dispatch I0",
+      "dispatch I1",
+      "dispatch I2",
+      "writeback I0",
+      "writeback I1",
+      "commit I0",
+      "resolve I1 not-taken",
+      "dispatch I2",
+      "writeback I2#1"
+    ].join("\n")
+  },
+  "正确：重取实例收到自身写回后提交": {
+    program: [
+      "ADD R1,R0,R0",
+      "BEQ R1,R0 predict=taken",
+      "ADD R2,R1,R0"
+    ].join("\n"),
+    events: [
+      "dispatch I0",
+      "dispatch I1",
+      "dispatch I2",
+      "writeback I0",
+      "writeback I1",
+      "commit I0",
+      "resolve I1 not-taken",
+      "dispatch I2",
+      "writeback I2#2",
+      "commit I1",
+      "commit I2"
+    ].join("\n")
+  },
   "违规：异常回滚后写回迟到": {
     program: [
       "ADD R1,R0,R0",
@@ -324,11 +362,53 @@ function robCards(snap) {
     }
     if (e.has_exception) flags.push('<span class="flag on" style="color:var(--bad)">EXC</span>');
     card.innerHTML =
-      `<div class="t">${idx === 0 ? "▶ " : ""}I${e.seq} ${escapeHtml(e.name)}</div>
+      `<div class="t">${idx === 0 ? "▶ " : ""}I${e.seq}<span class="gen">#${e.generation}</span> ${escapeHtml(e.name)}</div>
        <div class="meta">tag=P${e.tag}${e.old_tag !== null ? ` old=P${e.old_tag}` : ""}</div>
        <div class="flags">${flags.join("")}</div>`;
     wrap.appendChild(card);
   });
+  return wrap;
+}
+
+function execLedger(snap) {
+  const wrap = document.createElement("div");
+  wrap.className = "exec-ledger";
+  const execs = snap.executions || [];
+  if (!execs.length) {
+    wrap.innerHTML = '<span class="chip">尚无动态执行</span>';
+    return wrap;
+  }
+  // Group by static seq so successive fetches of one instruction compare.
+  const groups = new Map();
+  for (const x of execs) {
+    if (!groups.has(x.seq)) groups.set(x.seq, []);
+    groups.get(x.seq).push(x);
+  }
+  for (const [seq, xs] of groups) {
+    xs.forEach(x => {
+      const card = document.createElement("div");
+      card.className = "exec-card status-" + x.status + (x.generation > 1 ? " refetch" : "");
+      const tagText = x.tag !== null ? `P${x.tag}` : "—（分支不占标签）";
+      const oldText = x.old_tag !== null
+        ? `旧映射 <span class="tag-old">P${x.old_tag}</span>（ROB 回收依据）`
+        : "无旧标签";
+      const srcText = x.src_tags && x.src_tags.length
+        ? `源读 [${x.src_tags.map(t => "P" + t).join(",")}]` : "";
+      let statusLine;
+      if (x.status === "squashed") {
+        statusLine = `<span class="estatus bad">已清除@事件#${x.squashed_at}：${escapeHtml(x.squash_cause || "")}</span>`;
+      } else if (x.status === "committed") {
+        statusLine = `<span class="estatus ok">已提交@事件#${x.committed_at}</span>`;
+      } else {
+        statusLine = '<span class="estatus live">在 ROB 中</span>';
+      }
+      card.innerHTML =
+        `<div class="t">I${seq}<span class="gen">#${x.generation}</span> ${escapeHtml(x.name)}</div>
+         <div class="meta">分配 <span class="tag">${tagText}</span> · ${oldText}${srcText ? " · " + srcText : ""}</div>
+         <div class="meta">完成：${x.done ? `是（写回@事件#${x.done_at}）` : "否"} · ${statusLine}</div>`;
+      wrap.appendChild(card);
+    });
+  }
   return wrap;
 }
 
@@ -374,12 +454,29 @@ function renderStepDetail(step) {
   if (action && action.action === "dispatch") {
     const ev = document.createElement("div");
     ev.className = "evidence";
+    const refetchNote = action.refetched
+      ? `<li><strong style="color:#ffc861">重取分派（第 ${action.generation} 次执行）</strong>：静态 I${action.seq} 的第 ${action.previous_generation} 次执行已被清除，本次执行只有收到<strong>属于自身代次 #${action.generation}</strong> 的写回才能完成并提交</li>`
+      : `<li>动态执行代次：#${action.generation}</li>`;
     ev.innerHTML =
       `<h4>分派证据</h4>
        <ul>
+         ${refetchNote}
          <li>目的物理标签：新分配 <span class="tag">P${action.tag}</span>${action.old_tag !== null ? `，旧标签 <span class="tag-old">P${action.old_tag}</span>（记入 ROB，提交时回收）` : "（分支，不分配标签）"}</li>
          <li>源操作数按当时映射读取：${action.src_tags.map((t, i) => `Rs${i}=<span class="tag">P${t}</span>`).join("，")}</li>
          ${action.checkpoint ? `<li>建立分支检查点：map=[${action.checkpoint.map_table.map(p => "P" + p).join(",")}]，free=[${action.checkpoint.free_list.map(p => "P" + p).join(",")}]</li>` : ""}
+       </ul>`;
+    frag.appendChild(ev);
+  }
+
+  if (action && action.action === "writeback") {
+    const ev = document.createElement("div");
+    ev.className = "evidence";
+    const namedGen = step.event.generation;
+    ev.innerHTML =
+      `<h4>写回证据</h4>
+       <ul>
+         <li>完成事件记到动态实例 <strong>I${action.seq}#${action.generation}</strong>${namedGen ? `（事件显式指定 #${namedGen}）` : "（无限定，归属当前活实例）"}，标签 <span class="tag">P${action.tag}</span></li>
+         <li>同一静态指令的更老执行保持各自独立：被清除实例的迟到写回不得标记本实例完成</li>
        </ul>`;
     frag.appendChild(ev);
   }
@@ -434,6 +531,9 @@ function renderStepDetail(step) {
   frag.appendChild(h3("ROB（事件后）"));
   frag.appendChild(robCards(after));
 
+  frag.appendChild(h3("动态执行台账（按静态指令分组；重取产生新代次，清除实例保留映射/ROB/回收依据）"));
+  frag.appendChild(execLedger(after));
+
   const freeRow = document.createElement("div");
   freeRow.className = "before-after";
   const fl = document.createElement("div");
@@ -467,7 +567,7 @@ function renderRollbackEvidence(a) {
   const ev = document.createElement("div");
   ev.className = "evidence";
   const squashed = a.squashed.map(s =>
-    `I${s.seq}(tag P${s.tag}${s.was_done ? "，已写回" : ""})`).join("、") || "无";
+    `I${s.seq}#${s.generation}(tag P${s.tag}${s.was_done ? "，已写回" : ""})`).join("、") || "无";
   ev.innerHTML =
     `<h4>误预测回滚证据 — 分支 I${a.seq}（预测 ${a.predicted_taken ? "taken" : "not-taken"}，实际 ${a.taken ? "taken" : "not-taken"}）</h4>
      <ul>

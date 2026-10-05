@@ -77,7 +77,8 @@ class Session:
                     for i in self.instructions
                 ],
                 "events": [
-                    {"kind": e.kind, "seq": e.seq, "taken": e.taken, "text": e.text,
+                    {"kind": e.kind, "seq": e.seq, "taken": e.taken,
+                     "generation": e.generation, "text": e.text,
                      "description": e.describe()}
                     for e in self.events
                 ],

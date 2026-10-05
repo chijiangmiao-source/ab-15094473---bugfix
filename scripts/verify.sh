@@ -19,7 +19,7 @@ echo "== [1/3] build check: python3 -m compileall =="
 python3 -m compileall -q app scripts tests
 echo "   compile OK"
 
-echo "== [2/3] unit + API tests (branch rollback & precise exceptions) =="
+echo "== [2/3] unit + API tests (rollback / precise exceptions / re-fetch identity) =="
 python3 -m unittest discover -s tests -v
 
 if [ -z "${TARGET_URL:-}" ]; then

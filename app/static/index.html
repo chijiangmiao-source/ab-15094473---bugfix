@@ -24,7 +24,7 @@
     <label for="program-input">指令流（至多 24 条；ADD/SUB/AND/OR/XOR/SLT/MUL Rd,Rs,Rt；BEQ/BNE Rs,Rt predict=taken|not-taken）</label>
     <textarea id="program-input" spellcheck="false" rows="9"></textarea>
 
-    <label for="events-input">事件序列（至多 96 项；dispatch / writeback / resolve &lt;seq&gt; taken|not-taken / commit [seq] / exception）</label>
+    <label for="events-input">事件序列（至多 96 项；dispatch / writeback [I序号#代次，如 writeback I3#1 表示第一次执行] / resolve &lt;seq&gt; taken|not-taken / commit [seq] / exception）</label>
     <textarea id="events-input" spellcheck="false" rows="11"></textarea>
 
     <div class="controls">

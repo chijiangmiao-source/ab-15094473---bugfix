@@ -8,7 +8,10 @@ Models a checkpoint-based rename / ROB machine:
 * in-order dispatch renames the destination, records the previous mapping
   (old tag) in the ROB, and snapshots a per-conditional-branch checkpoint.
 * writeback marks the ROB entry complete; a writeback that arrives after the
-  instruction was squashed is a violation.
+  instruction was squashed is a violation. Completions identify the dynamic
+  execution by generation ("writeback I3#1" / gen=): a writeback left over
+  from a squashed first dispatch must never complete a re-fetched second
+  dispatch of the same static instruction.
 * resolve on a conditional branch: on a misprediction every younger ROB
   entry is squashed and the map / free list are restored from that branch's
   checkpoint; a correctly predicted branch simply retires its checkpoint.
@@ -75,13 +78,18 @@ class Event:
     kind: str  # dispatch | writeback | resolve | commit | exception
     seq: Optional[int] = None
     taken: Optional[bool] = None
+    generation: Optional[int] = None  # explicit "I3#2" / gen=2 completion target
     text: str = ""
+
+    def target_name(self) -> str:
+        base = f"I{self.seq}"
+        return base if self.generation is None else f"{base}#{self.generation}"
 
     def describe(self) -> str:
         if self.kind == "dispatch":
             return f"dispatch I{self.seq}"
         if self.kind == "writeback":
-            return f"writeback I{self.seq}"
+            return f"writeback {self.target_name()}"
         if self.kind == "resolve":
             direction = "taken" if self.taken else "not-taken"
             return f"resolve I{self.seq} {direction}"
@@ -117,6 +125,56 @@ class RobEntry:
             "resolved": self.resolved,
             "taken": self.taken,
             "has_exception": self.has_exception,
+        }
+
+
+@dataclass
+class ExecutionRecord:
+    """Ledger entry for one dynamic dispatch of a static instruction.
+
+    A static instruction fetched again after a squash gets a new generation;
+    its previous (squashed) execution is retained here forever — with its
+    physical tag, old-tag ROB basis, completion state and the event that
+    reclaimed it — so a stale completion from that execution can still be
+    identified and rejected after the re-fetch."""
+
+    seq: int
+    generation: int
+    instr_name: str
+    op: str
+    dest: Optional[int]
+    is_branch: bool
+    tag: Optional[int]
+    old_tag: Optional[int]
+    src_tags: list
+    status: str = "active"              # active | squashed | committed
+    done: bool = False
+    resolved: bool = False
+    dispatched_at: int = 0
+    done_at: Optional[int] = None
+    squashed_at: Optional[int] = None
+    squash_cause: Optional[str] = None
+    committed_at: Optional[int] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "seq": self.seq,
+            "generation": self.generation,
+            "name": self.instr_name,
+            "op": self.op,
+            "dest": self.dest,
+            "is_branch": self.is_branch,
+            "tag": self.tag,
+            "old_tag": self.old_tag,
+            "src_tags": list(self.src_tags),
+            "status": self.status,
+            "done": self.done,
+            "resolved": self.resolved,
+            "dispatched_at": self.dispatched_at,
+            "done_at": self.done_at,
+            "squashed_at": self.squashed_at,
+            "squash_cause": self.squash_cause,
+            "committed_at": self.committed_at,
         }
 
 
@@ -222,13 +280,16 @@ def parse_events(lines) -> list:
         args = toks[1:]
         try:
             if kind == "dispatch":
-                seq = _seq_arg(args, 0, idx)
+                seq, gen = _seq_arg(args, 0, idx)
+                _reject_generation(kind, args[0], gen)
                 events.append(Event("dispatch", seq=seq, text=line))
             elif kind == "writeback" or kind == "wb":
-                seq = _seq_arg(args, 0, idx)
-                events.append(Event("writeback", seq=seq, text=line))
+                seq, explicit_gen = _seq_arg(args, 0, idx)
+                gen = _gen_kwarg(args, explicit_gen)
+                events.append(Event("writeback", seq=seq, generation=gen, text=line))
             elif kind == "resolve":
-                seq = _seq_arg(args, 0, idx)
+                seq, gen = _seq_arg(args, 0, idx)
+                _reject_generation(kind, args[0], gen)
                 if len(args) < 2:
                     raise ValueError("resolve needs <seq> taken|not-taken")
                 direction = args[1].strip().lower()
@@ -240,10 +301,15 @@ def parse_events(lines) -> list:
                     raise ValueError(f"bad direction '{args[1]}'")
                 events.append(Event("resolve", seq=seq, taken=taken, text=line))
             elif kind == "commit":
-                seq = _seq_arg(args, 0, idx, required=False) if args else None
+                if args:
+                    seq, gen = _seq_arg(args, 0, idx, required=False)
+                    _reject_generation(kind, args[0], gen)
+                else:
+                    seq = None
                 events.append(Event("commit", seq=seq, text=line))
             elif kind == "exception" or kind == "exc":
-                seq = _seq_arg(args, 0, idx)
+                seq, gen = _seq_arg(args, 0, idx)
+                _reject_generation(kind, args[0], gen)
                 events.append(Event("exception", seq=seq, text=line))
             else:
                 raise ValueError(f"unknown event kind '{kind}'")
@@ -256,16 +322,46 @@ def parse_events(lines) -> list:
 
 
 def _seq_arg(args, pos, line_idx, required=True):
+    """Parse an instruction reference, optionally tagged with its dynamic
+    generation: I3#1 / 3#1 (writeback I3#1 targets the first execution)."""
     if len(args) <= pos:
         if required:
             raise ValueError("missing instruction sequence number")
-        return None
+        return None, None
     t = args[pos].strip().upper()
+    generation = None
+    if "#" in t:
+        t, gtok = t.split("#", 1)
+        if not gtok.isdigit() or int(gtok) < 1:
+            raise ValueError(f"bad generation '{args[pos]}', expected I<n>#<generation>=1..")
+        generation = int(gtok)
     if t.startswith("I") and t[1:].isdigit():
         t = t[1:]
     if not t.isdigit():
         raise ValueError(f"bad sequence number '{args[pos]}'")
-    return int(t)
+    return int(t), generation
+
+
+def _gen_kwarg(args, explicit_gen):
+    """Pick up a gen=<n> (generation=<n>) qualifier on a writeback event."""
+    gen = explicit_gen
+    for a in args[1:]:
+        tok = a.strip().lower()
+        if tok.startswith("gen=") or tok.startswith("generation="):
+            val = tok.split("=", 1)[1]
+            if not val.isdigit() or int(val) < 1:
+                raise ValueError(f"bad generation qualifier '{a}'")
+            if gen is not None and gen != int(val):
+                raise ValueError("conflicting generation specifiers")
+            gen = int(val)
+    return gen
+
+
+def _reject_generation(kind, token, generation):
+    if generation is not None:
+        raise ValueError(
+            f"generation qualifier ({token}) is only valid on writeback, not on {kind}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +379,11 @@ class Simulator:
         self.rob = []                                    # list[RobEntry], head first
         self.by_seq: dict[int, RobEntry] = {}
         self.dispatch_generations: dict[int, int] = {}
+        # Ledger of every dynamic dispatch, keyed by (static seq, generation);
+        # squashed executions are retained so late completions stay
+        # attributable even after the same instruction is re-fetched.
+        self.executions: dict[tuple, ExecutionRecord] = {}
+        self.execution_order: list[tuple] = []
         self.checkpoints: dict[int, dict] = {}           # branch seq -> checkpoint
         self.next_dispatch = 0
         self.committed = []
@@ -309,6 +410,12 @@ class Simulator:
             "rob": [e.to_dict() for e in self.rob],
             "committed": list(self.committed),
             "squashed": sorted(self.squashed),
+            # Every dynamic execution ever dispatched, in dispatch order;
+            # squashed instances survive re-fetches with their tag / old-tag
+            # / reclaim evidence.
+            "executions": [
+                self.executions[key].to_dict() for key in self.execution_order
+            ],
             "checkpoints": {
                 str(seq): {
                     "map_table": list(cp["map_table"]),
@@ -404,11 +511,28 @@ class Simulator:
         if not refetching:
             self.next_dispatch += 1
         self.counters["dispatch"] += 1
+
+        record = ExecutionRecord(
+            seq=seq,
+            generation=generation,
+            instr_name=instr.name,
+            op=instr.op,
+            dest=instr.dest,
+            is_branch=instr.is_branch,
+            tag=tag,
+            old_tag=old_tag,
+            src_tags=src_tags,
+            status="active",
+            dispatched_at=self.processed,
+        )
+        self.executions[(seq, generation)] = record
+        self.execution_order.append((seq, generation))
         return {
             "action": "dispatch",
             "seq": seq,
             "generation": generation,
             "refetched": refetching,
+            "previous_generation": generation - 1 if refetching else None,
             "tag": tag,
             "old_tag": old_tag,
             "src_tags": src_tags,
@@ -419,27 +543,102 @@ class Simulator:
         seq = ev.seq
         if seq is None or not 0 <= seq < len(self.instructions):
             raise Violation("WRITEBACK_UNKNOWN_SEQ", f"writeback refers to unknown I{seq}")
-        if seq in self.squashed:
-            raise Violation(
-                "WRITEBACK_AFTER_SQUASH",
-                f"writeback for I{seq} rejected: instruction was already squashed by an "
-                f"older resolved branch or precise-exception rollback; its result must "
-                f"never reach committed architectural state",
-                self._squash_evidence(seq),
-            )
-        if seq in self.committed:
-            raise Violation("WRITEBACK_AFTER_COMMIT", f"I{seq} already committed")
+
         entry = self._lookup(seq)
-        if entry is None:
-            raise Violation(
-                "WRITEBACK_NOT_DISPATCHED",
-                f"writeback for I{seq} before it was dispatched",
-            )
+        if ev.generation is not None:
+            # Explicit dynamic-instance qualification, e.g. writeback I3#1:
+            # the completion names the exact dispatch it belongs to. A
+            # completion from a squashed execution stays attributable (and
+            # rejected) even after a re-fetch created a newer generation.
+            record = self.executions.get((seq, ev.generation))
+            if record is None:
+                raise Violation(
+                    "WRITEBACK_NOT_DISPATCHED",
+                    f"writeback for {ev.target_name()} but execution generation "
+                    f"{ev.generation} of I{seq} was never dispatched",
+                    {"seq": seq, "requested_generation": ev.generation,
+                     "generations": sorted(g for s, g in self.execution_order if s == seq)},
+                )
+            if record.status == "squashed":
+                raise Violation(
+                    "WRITEBACK_AFTER_SQUASH",
+                    f"writeback for {ev.target_name()} rejected: that execution was squashed "
+                    f"at event #{record.squashed_at} ({record.squash_cause}); its stale "
+                    f"completion must never mark a later re-fetched execution of I{seq} "
+                    f"done — the new execution may commit only after its own writeback",
+                    self._execution_evidence(seq, ev.generation),
+                )
+            if record.status == "committed":
+                raise Violation("WRITEBACK_AFTER_COMMIT",
+                                f"{ev.target_name()} already committed")
+            if entry is None or entry.generation != ev.generation:
+                raise Violation(
+                    "WRITEBACK_STALE_GENERATION",
+                    f"writeback targets {ev.target_name()} but that execution is not live "
+                    f"(current live generation: "
+                    f"{entry.generation if entry is not None else 'none'})",
+                    self._execution_evidence(seq, ev.generation),
+                )
+        else:
+            # Unqualified writeback belongs to the currently live execution.
+            if entry is None:
+                squashed_rec = self._squashed_execution(seq)
+                if squashed_rec is not None:
+                    raise Violation(
+                        "WRITEBACK_AFTER_SQUASH",
+                        f"writeback for I{seq} rejected: its execution was already squashed "
+                        f"at event #{squashed_rec.squashed_at} ({squashed_rec.squash_cause}) "
+                        f"and I{seq} has not been re-fetched; the wrong-path result must "
+                        f"never reach committed architectural state",
+                        self._execution_evidence(seq, squashed_rec.generation),
+                    )
+                if seq in self.committed:
+                    raise Violation("WRITEBACK_AFTER_COMMIT", f"I{seq} already committed")
+                raise Violation(
+                    "WRITEBACK_NOT_DISPATCHED",
+                    f"writeback for I{seq} before it was dispatched",
+                )
+
         if entry.done:
-            raise Violation("WRITEBACK_DUPLICATE", f"I{seq} already wrote back")
+            raise Violation("WRITEBACK_DUPLICATE",
+                            f"I{seq} generation {entry.generation} already wrote back")
         entry.done = True
+        record = self.executions[(seq, entry.generation)]
+        record.done = True
+        record.done_at = self.processed
         self.counters["writeback"] += 1
-        return {"action": "writeback", "seq": seq, "tag": entry.tag}
+        return {
+            "action": "writeback",
+            "seq": seq,
+            "generation": entry.generation,
+            "tag": entry.tag,
+        }
+
+    def _squashed_execution(self, seq) -> Optional[ExecutionRecord]:
+        """Latest squashed execution of seq (used when no live execution exists)."""
+        gens = [g for (s, g) in self.execution_order if s == seq]
+        for g in reversed(gens):
+            rec = self.executions[(seq, g)]
+            if rec.status == "squashed":
+                return rec
+        return None
+
+    def _execution_evidence(self, seq, generation) -> dict:
+        rec = self.executions.get((seq, generation))
+        live = self._lookup(seq)
+        return {
+            "seq": seq,
+            "stale_generation": generation,
+            "stale_execution": rec.to_dict() if rec is not None else None,
+            "live_generation": live.generation if live is not None else None,
+            "generations": [
+                self.executions[(s, g)].to_dict()
+                for (s, g) in self.execution_order if s == seq
+            ],
+            "squashed": sorted(self.squashed),
+            "committed": list(self.committed),
+            "rob_head": self.rob[0].seq if self.rob else None,
+        }
 
     def _do_resolve(self, ev: Event) -> dict:
         seq = ev.seq
@@ -486,15 +685,21 @@ class Simulator:
 
         younger = [e for e in self.rob if e.seq > seq]
         squashed_records = []
+        squash_event = self.processed
         for e in younger:
             squashed_records.append(
-                {"seq": e.seq, "tag": e.tag, "old_tag": e.old_tag, "dest": e.instr.dest,
-                 "was_done": e.done}
+                {"seq": e.seq, "generation": e.generation, "tag": e.tag,
+                 "old_tag": e.old_tag, "dest": e.instr.dest, "was_done": e.done}
             )
             self.squashed.add(e.seq)
             self.rob.remove(e)
             self.by_seq.pop(e.seq, None)
             self.checkpoints.pop(e.seq, None)
+            rec = self.executions.get((e.seq, e.generation))
+            if rec is not None:
+                rec.status = "squashed"
+                rec.squashed_at = squash_event
+                rec.squash_cause = f"mispredict of older branch I{seq}"
 
         restored = [
             {"arch": r, "from": self.map_table[r], "to": cp["map_table"][r]}
@@ -559,6 +764,10 @@ class Simulator:
         self.by_seq.pop(head.seq, None)
         self.committed.append(head.seq)
         self.counters["commit"] += 1
+        rec = self.executions.get((head.seq, head.generation))
+        if rec is not None:
+            rec.status = "committed"
+            rec.committed_at = self.processed
         reclaimed_old = None
         if head.old_tag is not None:
             self.free_list.append(head.old_tag)
@@ -620,6 +829,7 @@ class Simulator:
         reclaimed = []
         restored = []
         discarded = []
+        squash_event = self.processed
 
         def rollback_entry(e: RobEntry):
             if e.instr.dest is not None and self.map_table[e.instr.dest] == e.tag:
@@ -632,10 +842,18 @@ class Simulator:
                 self.free_list.append(e.tag)
             reclaimed.append(e.tag)
             discarded.append(
-                {"seq": e.seq, "tag": e.tag, "old_tag": e.old_tag,
-                 "dest": e.instr.dest, "was_done": e.done,
+                {"seq": e.seq, "generation": e.generation, "tag": e.tag,
+                 "old_tag": e.old_tag, "dest": e.instr.dest, "was_done": e.done,
                  "is_faulting": e.seq == fault.seq}
             )
+            rec = self.executions.get((e.seq, e.generation))
+            if rec is not None:
+                rec.status = "squashed"
+                rec.squashed_at = squash_event
+                rec.squash_cause = (
+                    f"precise exception at fault I{fault.seq}"
+                    if e.seq != fault.seq else "precise exception (faulting instruction)"
+                )
 
         for e in reversed(everyone[1:]):
             rollback_entry(e)
@@ -692,7 +910,8 @@ class Simulator:
         self.processed += 1
         step = {
             "index": self.processed - 1,
-            "event": {"kind": ev.kind, "seq": ev.seq, "taken": ev.taken, "text": ev.text},
+            "event": {"kind": ev.kind, "seq": ev.seq, "taken": ev.taken,
+                      "generation": ev.generation, "text": ev.text},
             "description": ev.describe(),
             "before": before,
             "action": action,

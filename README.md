@@ -16,8 +16,13 @@
   （默认 16 个：P8–P15）从空闲表分配。
 * **dispatch（按程序序）**：目的寄存器从空闲表取下一个标签，旧标签记入 ROB；
   源寄存器按**当时映射**读取；条件分支建立检查点（分支本身不占用目的标签）。
-* **writeback**：标记 ROB 项完成；指令一旦被更老分支回滚或异常回滚清除，
-  随后到达的写回一律拒绝（`WRITEBACK_AFTER_SQUASH`）。
+  同一静态指令被清除后重新分派会产生新的**动态执行代次（generation）**。
+* **writeback**：标记 ROB 项完成，完成事件归属**当前活实例**；也可用
+  `writeback I3#1`（或 `gen=1` / `generation=1`）显式指定它属于哪一次动态执行。
+  指令一旦被更老分支回滚或异常回滚清除，随后到达的写回一律拒绝
+  （`WRITEBACK_AFTER_SQUASH`）——**即使该静态指令已被重新分派**：第一次执行
+  遗留的写回不得冒名标记新实例完成，重取实例只有收到属于自身代次的完成事件
+  后才可提交。
 * **resolve**：条件分支解析。
   * 预测正确 → 释放该分支检查点；
   * 误预测 → 清除 ROB 中全部更年轻指令、回收其物理标签、映射表/空闲表恢复到
@@ -35,7 +40,8 @@
 | `DISPATCH_OUT_OF_ORDER` / `DISPATCH_DUPLICATE` / `DISPATCH_UNKNOWN_SEQ` | 分派序错误 |
 | `NO_FREE_PHYS_REG` | 空闲物理寄存器耗尽 |
 | `WRITEBACK_NOT_DISPATCHED` / `WRITEBACK_DUPLICATE` | 写回时序错误 |
-| `WRITEBACK_AFTER_SQUASH` | 已被回滚清除的指令写回到达（错误路径结果） |
+| `WRITEBACK_AFTER_SQUASH` | 已被回滚清除的执行写回到达（错误路径结果；重取后旧代次迟到写回同样在此拒绝） |
+| `WRITEBACK_STALE_GENERATION` | 显式代次不是当前活实例 |
 | `RESOLVE_NOT_BRANCH` / `RESOLVE_UNFINISHED` / `RESOLVE_DUPLICATE` / `RESOLVE_STALE` | 分支解析错误 |
 | `COMMIT_EMPTY_ROB` / `COMMIT_NOT_HEAD` / `COMMIT_UNFINISHED` / `COMMIT_UNRESOLVED_BRANCH` | 提交序/完成度违规 |
 | `EXCEPTION_NOT_DISPATCHED` / `EXCEPTION_DUPLICATE` / `EXCEPTION_AFTER_COMMIT` / `EXCEPTION_AFTER_SQUASH` | 异常边界违规 |
@@ -60,7 +66,13 @@ writeback I0
 resolve I0 taken            # 或 not-taken
 commit I0                   # 序号可省略，表示提交当前 ROB 队首
 exception I2
+writeback I3#1              # 显式归属第一次动态执行（重取后用于区分两次执行）
+writeback I3 gen=2          # 等价写法：I3#2
 ```
+
+逐步页面的 **动态执行台账**按静态指令分组展示每一次动态执行（`I3#1`/`I3#2`），
+并为被清除实例保留其物理标签、旧标签（提交时 ROB 回收依据）、源读标签、清除
+事件位置与原因；ROB 卡片标注 `#代次`。
 
 ## 本地运行
 
@@ -108,7 +120,7 @@ docker compose up --build --abort-on-container-exit verify
 ```bash
 bash scripts/verify.sh                      # 自启临时服务器并冒烟
 TARGET_URL=http://host:port bash scripts/verify.sh
-python3 -m unittest discover -s tests -v    # 仅单元/API 测试（45 项）
+python3 -m unittest discover -s tests -v    # 仅单元/API 测试（65 项）
 python3 scripts/smoke.py http://127.0.0.1:8080
 ```
 

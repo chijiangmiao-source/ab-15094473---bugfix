@@ -35,6 +35,41 @@ resolve I2 not-taken
 
 EVENTS_BAD = EVENTS_OK + "\nwriteback I3"  # I3 squashed: late writeback rejected
 
+# Re-fetch identity boundary: I2 is squashed by the mispredicted branch I1,
+# then re-dispatched. A completion belonging to the first execution
+# ("writeback I2#1") must not complete the new execution.
+PROG_REFETCH = """
+ADD R1,R0,R0
+BEQ R1,R0 predict=taken
+ADD R2,R1,R0
+"""
+
+EVENTS_REFETCH_STALE = """
+dispatch I0
+dispatch I1
+dispatch I2
+writeback I0
+writeback I1
+commit I0
+resolve I1 not-taken
+dispatch I2
+writeback I2#1
+"""
+
+EVENTS_REFETCH_OK = """
+dispatch I0
+dispatch I1
+dispatch I2
+writeback I0
+writeback I1
+commit I0
+resolve I1 not-taken
+dispatch I2
+writeback I2#2
+commit I1
+commit I2
+"""
+
 
 class ServerHarness:
     def __init__(self):
@@ -139,6 +174,66 @@ class HttpApiTests(unittest.TestCase):
     def test_unknown_session_404(self):
         with ServerHarness() as h:
             h.request("/api/sessions/nope/step", "POST", expect_status=404)
+
+    def test_simulate_rejects_stale_writeback_after_refetch(self):
+        with ServerHarness() as h:
+            status, body = h.request("/api/simulate", "POST",
+                                     {"program": PROG_REFETCH, "events": EVENTS_REFETCH_STALE}, 200)
+            self.assertFalse(body["ok"])
+            self.assertEqual(body["violation"]["code"], "WRITEBACK_AFTER_SQUASH")
+            self.assertEqual(body["violation_step"], 8)
+            ev = body["violation"]["evidence"]
+            self.assertEqual(ev["stale_generation"], 1)
+            self.assertEqual(ev["live_generation"], 2)
+
+    def test_simulate_refetched_execution_own_completion_ok(self):
+        with ServerHarness() as h:
+            status, body = h.request("/api/simulate", "POST",
+                                     {"program": PROG_REFETCH, "events": EVENTS_REFETCH_OK}, 200)
+            self.assertTrue(body["ok"])
+            self.assertEqual(body["final"]["committed"], [0, 1, 2])
+
+    def test_session_step_stale_writeback_after_refetch(self):
+        with ServerHarness() as h:
+            status, s = h.request("/api/sessions", "POST",
+                                  {"program": PROG_REFETCH, "events": EVENTS_REFETCH_STALE}, 201)
+            sid = s["id"]
+            for _ in range(8):
+                r = h.request(f"/api/sessions/{sid}/step", "POST", expect_status=200)[1]
+                self.assertIsNone(r["state"]["violation"])
+            r = h.request(f"/api/sessions/{sid}/step", "POST", expect_status=200)[1]
+            self.assertEqual(r["state"]["violation"]["code"], "WRITEBACK_AFTER_SQUASH")
+            self.assertTrue(r["state"]["done"])
+            current = r["state"]["current"]
+            # Re-fetched gen-2 entry must NOT have been marked done by gen1.
+            self.assertEqual(
+                [(e["seq"], e["generation"], e["done"]) for e in current["rob"]],
+                [(1, 1, True), (2, 2, False)])
+            ledger = {(e["seq"], e["generation"]): e for e in current["executions"]}
+            self.assertEqual(ledger[(2, 1)]["status"], "squashed")
+            self.assertEqual(ledger[(2, 2)]["status"], "active")
+            self.assertFalse(ledger[(2, 2)]["done"])
+            # stepping again is a no-op once the violation was located
+            r = h.request(f"/api/sessions/{sid}/step", "POST", expect_status=200)[1]
+            self.assertTrue(r["already_failed"])
+
+    def test_session_step_refetch_own_writeback_then_commit(self):
+        with ServerHarness() as h:
+            status, s = h.request("/api/sessions", "POST",
+                                  {"program": PROG_REFETCH, "events": EVENTS_REFETCH_OK}, 201)
+            sid = s["id"]
+            for _ in range(11):
+                h.request(f"/api/sessions/{sid}/step", "POST", expect_status=200)
+            state = h.request(f"/api/sessions/{sid}", expect_status=200)[1]
+            self.assertTrue(state["done"])
+            self.assertIsNone(state["violation"])
+            self.assertEqual(state["current"]["committed"], [0, 1, 2])
+            ledger = {(e["seq"], e["generation"]): e for e in state["current"]["executions"]}
+            self.assertEqual(ledger[(2, 1)]["status"], "squashed")
+            self.assertEqual(ledger[(2, 2)]["status"], "committed")
+            # reset and replay stays green
+            r = h.request(f"/api/sessions/{sid}/reset", "POST", expect_status=200)[1]
+            self.assertEqual(r["state"]["cursor"], 0)
 
 
 if __name__ == "__main__":

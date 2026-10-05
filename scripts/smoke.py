@@ -39,6 +39,40 @@ resolve I2 not-taken
 
 EVENTS_BAD = EVENTS_OK + "\nwriteback I3\n"
 
+# Same static instruction re-fetched after a mispredict: the first
+# execution's late completion must not complete the re-fetched execution.
+REFETCH_PROG = """
+ADD R1,R0,R0
+BEQ R1,R0 predict=taken
+ADD R2,R1,R0
+"""
+
+REFETCH_STALE_EVENTS = """
+dispatch I0
+dispatch I1
+dispatch I2
+writeback I0
+writeback I1
+commit I0
+resolve I1 not-taken
+dispatch I2
+writeback I2#1
+"""
+
+REFETCH_OK_EVENTS = """
+dispatch I0
+dispatch I1
+dispatch I2
+writeback I0
+writeback I1
+commit I0
+resolve I1 not-taken
+dispatch I2
+writeback I2#2
+commit I1
+commit I2
+"""
+
 failures = []
 
 
@@ -88,6 +122,9 @@ def main():
     status, raw = request("GET", "/static/app.js")
     check("GET /static/app.js served", status == 200 and len(raw) > 500, f"status={status}")
 
+    status, raw = request("GET", "/static/styles.css")
+    check("GET /static/styles.css served", status == 200 and len(raw) > 200, f"status={status}")
+
     status, raw = request("POST", "/api/validate",
                           {"program": PROG, "events": EVENTS_OK})
     body = json.loads(raw.decode())
@@ -121,6 +158,71 @@ def main():
     check("API flags late writeback after precise-exception rollback",
           body.get("ok") is False
           and body["violation"]["code"] == "WRITEBACK_AFTER_SQUASH", str(body)[:300])
+
+    # re-fetch identity boundary (one-shot): stale gen-1 completion rejected
+    status, raw = request("POST", "/api/simulate",
+                          {"program": REFETCH_PROG, "events": REFETCH_STALE_EVENTS})
+    body = json.loads(raw.decode())
+    evidence = (body.get("violation") or {}).get("evidence") or {}
+    check("API rejects stale gen-1 writeback after re-fetch at first violation",
+          status == 200 and body.get("ok") is False
+          and body["violation"]["code"] == "WRITEBACK_AFTER_SQUASH"
+          and body["violation_step"] == 8
+          and evidence.get("stale_generation") == 1
+          and evidence.get("live_generation") == 2
+          and (evidence.get("stale_execution") or {}).get("status") == "squashed",
+          str(body.get("violation"))[:300])
+
+    # re-fetched execution completes via its own completion and commits
+    status, raw = request("POST", "/api/simulate",
+                          {"program": REFETCH_PROG, "events": REFETCH_OK_EVENTS})
+    body = json.loads(raw.decode())
+    ledger = {(e["seq"], e["generation"]): e for e in body.get("final", {}).get("executions", [])}
+    check("API accepts re-fetched instance own completion then commits",
+          status == 200 and body.get("ok") is True
+          and body["final"]["committed"] == [0, 1, 2]
+          and ledger.get((2, 1), {}).get("status") == "squashed"
+          and ledger.get((2, 2), {}).get("status") == "committed",
+          str(body)[:300])
+
+    # incremental session API: stale completion must not mark gen-2 done
+    status, raw = request("POST", "/api/sessions",
+                          {"program": REFETCH_PROG, "events": REFETCH_STALE_EVENTS})
+    session = json.loads(raw.decode())
+    sid = session.get("id", "")
+    check("POST /api/sessions creates refetch session", status == 201 and bool(sid),
+          str(session)[:200])
+    if sid:
+        for _ in range(8):
+            request("POST", f"/api/sessions/{sid}/step")
+        status, raw = request("POST", f"/api/sessions/{sid}/step")
+        step_body = json.loads(raw.decode())
+        current = (step_body.get("state") or {}).get("current") or {}
+        rob = [(e["seq"], e["generation"], e["done"]) for e in current.get("rob", [])]
+        led = {(e["seq"], e["generation"]): e for e in current.get("executions", [])}
+        check("session: stale writeback rejected, re-fetched gen-2 stays unfinished",
+              (step_body.get("state") or {}).get("violation", {}).get("code")
+              == "WRITEBACK_AFTER_SQUASH"
+              and rob == [(1, 1, True), (2, 2, False)]
+              and led.get((2, 1), {}).get("status") == "squashed"
+              and led.get((2, 2), {}).get("done") is False,
+              str(step_body)[:300])
+
+    # incremental session API: re-fetched gen-2 own completion then commits
+    status, raw = request("POST", "/api/sessions",
+                          {"program": REFETCH_PROG, "events": REFETCH_OK_EVENTS})
+    ok_session = json.loads(raw.decode())
+    osid = ok_session.get("id", "")
+    if osid:
+        for _ in range(11):
+            request("POST", f"/api/sessions/{osid}/step")
+        status, raw = request("GET", f"/api/sessions/{osid}")
+        final_state = json.loads(raw.decode())
+        check("session: own completion lets branch and re-fetched item commit",
+              status == 200 and final_state.get("violation") is None
+              and final_state.get("done") is True
+              and final_state["current"]["committed"] == [0, 1, 2],
+              str(final_state)[:300])
 
     # incremental session API
     status, raw = request("POST", "/api/sessions",

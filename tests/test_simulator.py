@@ -64,6 +64,25 @@ I1: BEQ R1, R0 predict=not-taken
         self.assertTrue(evs[2].taken)
         self.assertIsNone(evs[4].seq)
 
+    def test_parse_writeback_generation_qualifier(self):
+        evs = parse_events("writeback I3#1\nwb 3 gen=2\nwriteback I3 generation=1")
+        self.assertEqual([e.generation for e in evs], [1, 2, 1])
+        self.assertEqual(evs[0].describe(), "writeback I3#1")
+
+    def test_parse_bad_generation(self):
+        with self.assertRaises(ValueError):
+            parse_events("writeback I3#0")
+        with self.assertRaises(ValueError):
+            parse_events("writeback I3 gen=x")
+        with self.assertRaises(ValueError):
+            parse_events("writeback I3#1 gen=2")
+
+    def test_generation_qualifier_only_on_writeback(self):
+        for line in ("dispatch I0#1", "resolve I0#1 taken", "commit I0#1", "exception I0#1"):
+            with self.subTest(line=line):
+                with self.assertRaises(ValueError):
+                    parse_events(line)
+
     def test_bad_opcode(self):
         with self.assertRaises(ValueError):
             parse_program("FOO R1,R0,R0")
@@ -467,6 +486,172 @@ class ExceptionBoundaryTests(unittest.TestCase):
                     for m in rb["restored_mappings"]}
         self.assertEqual(restored[(4, 3)], (12, 10))  # I4 tag -> I2 tag
         self.assertEqual(restored[(2, 3)], (10, 3))   # I2 tag -> arch P3
+
+
+class RefetchStaleWritebackTests(unittest.TestCase):
+    """Boundary: after a misprediction clears a younger instruction and the
+    same static instruction is re-fetched, a completion left over from the
+    first (squashed) execution must never mark the new execution complete."""
+
+    PROG = """
+    ADD R1,R0,R0
+    BEQ R1,R0 predict=taken
+    ADD R2,R1,R0
+    """
+
+    PREFIX = """
+    dispatch I0
+    dispatch I1
+    dispatch I2
+    writeback I0
+    writeback I1
+    commit I0
+    resolve I1 not-taken
+    dispatch I2
+    """
+
+    def _report(self, tail, program=None):
+        return run(program or self.PROG, self.PREFIX + tail)
+
+    def _code(self, tail, program=None):
+        return violation_code(program or self.PROG, self.PREFIX + tail)
+
+    def test_stale_writeback_after_refetch_rejected_at_first_violation(self):
+        code, report = self._code("writeback I2#1")
+        self.assertEqual(code, "WRITEBACK_AFTER_SQUASH")
+        # The late writeback is event #8 (0-based), the first violation.
+        self.assertEqual(report["violation_step"], 8)
+        evidence = report["violation"]["evidence"]
+        self.assertEqual(evidence["seq"], 2)
+        self.assertEqual(evidence["stale_generation"], 1)
+        self.assertEqual(evidence["live_generation"], 2)
+        stale = evidence["stale_execution"]
+        self.assertEqual(stale["generation"], 1)
+        self.assertEqual(stale["status"], "squashed")
+        self.assertEqual(stale["squash_cause"], "mispredict of older branch I1")
+        self.assertEqual(stale["squashed_at"], 6)
+        # The cleared instance keeps its rename / ROB-reclaim evidence.
+        self.assertEqual(stale["tag"], 9)
+        self.assertEqual(stale["old_tag"], 2)
+        gens = {(g["generation"], g["status"]) for g in evidence["generations"]}
+        self.assertEqual(gens, {(1, "squashed"), (2, "active")})
+
+    def test_stale_writeback_keyword_gen_qualifier(self):
+        code, _ = self._code("writeback I2 gen=1")
+        self.assertEqual(code, "WRITEBACK_AFTER_SQUASH")
+
+    def test_stale_writeback_rejected_even_after_new_execution_done(self):
+        # The re-fetched execution completed legally; the stale completion
+        # arriving afterwards is still a wrong-path event and must be flagged.
+        code, report = self._code("writeback I2\nwriteback I2#1")
+        self.assertEqual(code, "WRITEBACK_AFTER_SQUASH")
+        self.assertEqual(report["violation_step"], 9)
+
+    def test_refetched_execution_completes_with_its_own_writeback_and_commits(self):
+        report = self._report("writeback I2\ncommit I1\ncommit I2")
+        self.assertTrue(report["ok"], report["violation"])
+        self.assertEqual(report["final"]["committed"], [0, 1, 2])
+        ledger = {(e["seq"], e["generation"]): e for e in report["final"]["executions"]}
+        first, second = ledger[(2, 1)], ledger[(2, 2)]
+        self.assertEqual(first["status"], "squashed")
+        self.assertFalse(first["done"])
+        self.assertEqual(second["status"], "committed")
+        self.assertTrue(second["done"])
+        self.assertIsNotNone(second["committed_at"])
+        # Both generations are separately visible in the final snapshot.
+        self.assertEqual(first["tag"], second["tag"])  # reclaimed tag re-alloc'd
+        self.assertEqual(first["old_tag"], second["old_tag"])
+
+    def test_refetched_execution_explicit_generation_writeback(self):
+        report = self._report("writeback I2#2\ncommit I1\ncommit I2")
+        self.assertTrue(report["ok"], report["violation"])
+        self.assertEqual(report["final"]["committed"], [0, 1, 2])
+
+    def test_refetched_execution_without_own_writeback_cannot_commit(self):
+        # No writeback for generation 2: the branch can commit but the
+        # re-fetched arithmetic instruction is unfinished at the ROB head.
+        code, report = self._code("commit I1\ncommit I2")
+        self.assertEqual(code, "COMMIT_UNFINISHED")
+        self.assertEqual(report["violation_step"], 9)
+
+    def test_unknown_generation_writeback_rejected(self):
+        code, _ = self._code("writeback I2#3")
+        self.assertEqual(code, "WRITEBACK_NOT_DISPATCHED")
+
+    def test_duplicate_writeback_for_generation(self):
+        code, _ = self._code("writeback I2\nwriteback I2")
+        self.assertEqual(code, "WRITEBACK_DUPLICATE")
+
+    def test_plain_late_writeback_without_refetch_still_rejected(self):
+        events = """
+        dispatch I0
+        dispatch I1
+        dispatch I2
+        writeback I0
+        writeback I1
+        commit I0
+        resolve I1 not-taken
+        writeback I2
+        """
+        code, report = violation_code(self.PROG, events)
+        self.assertEqual(code, "WRITEBACK_AFTER_SQUASH")
+        self.assertEqual(report["violation_step"], 7)
+        self.assertIsNone(report["violation"]["evidence"]["live_generation"])
+
+    def test_normal_misprediction_rollback_unchanged(self):
+        events = """
+        dispatch I0
+        dispatch I1
+        dispatch I2
+        writeback I0
+        writeback I1
+        commit I0
+        resolve I1 not-taken
+        dispatch I2
+        writeback I2
+        commit I1
+        commit I2
+        """
+        report = run(self.PROG, events)
+        self.assertTrue(report["ok"], report["violation"])
+        self.assertEqual(report["counters"]["mispredict"], 1)
+
+    def test_refetch_after_precise_exception_rejects_stale_writeback(self):
+        prog = """
+        ADD R1,R0,R0
+        MUL R2,R1,R0
+        ADD R3,R2,R1
+        """
+        events = """
+        dispatch I0
+        dispatch I1
+        dispatch I2
+        writeback I0
+        commit I0
+        writeback I1
+        exception I1
+        dispatch I1
+        dispatch I2
+        writeback I1#1
+        """
+        code, report = violation_code(prog, events)
+        self.assertEqual(code, "WRITEBACK_AFTER_SQUASH")
+        self.assertEqual(report["violation_step"], 9)
+        stale = report["violation"]["evidence"]["stale_execution"]
+        self.assertEqual(stale["status"], "squashed")
+        self.assertIn("precise exception", stale["squash_cause"])
+
+    def test_snapshot_distinguishes_generations_and_keeps_squashed_evidence(self):
+        report = self._report("writeback I2")
+        after_refetch = report["steps"][7]["after"]
+        # Right after the re-fetch dispatch, both generations appear.
+        execs = {(e["seq"], e["generation"]): e for e in after_refetch["executions"]}
+        self.assertEqual(execs[(2, 1)]["status"], "squashed")
+        self.assertEqual(execs[(2, 2)]["status"], "active")
+        self.assertEqual([(e["seq"], e["generation"]) for e in after_refetch["rob"]],
+                         [(1, 1), (2, 2)])
+        self.assertEqual(after_refetch["map_table"][2],
+                         execs[(2, 2)]["tag"])
 
 
 class IncrementalSimulatorTests(unittest.TestCase):

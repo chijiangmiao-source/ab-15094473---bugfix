@@ -208,6 +208,32 @@ table.state tr.section td { background: #121a2c; color: #9db1dd; text-align: lef
 .flag.off { color: #4b5776; }
 .flag.resolved { color: #8ec9ff; }
 
+.gen {
+  color: var(--warn);
+  font-size: 11px;
+  margin-left: 2px;
+}
+.exec-ledger { display: flex; flex-direction: column; gap: 6px; }
+.exec-card {
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  background: #0d1322;
+  font-family: var(--mono);
+  font-size: 11.5px;
+}
+.exec-card.status-active { border-left-color: var(--accent); }
+.exec-card.status-committed { border-left-color: var(--ok); }
+.exec-card.status-squashed { border-left-color: var(--bad); opacity: 0.92; }
+.exec-card.refetch { box-shadow: inset 0 0 0 1px rgba(255, 176, 32, 0.35); }
+.exec-card .t { font-weight: bold; }
+.exec-card .meta { color: var(--muted); margin-top: 2px; }
+.estatus { font-weight: bold; }
+.estatus.live { color: #8ec9ff; }
+.estatus.ok { color: var(--ok); }
+.estatus.bad { color: #ff8b8b; }
+
 .before-after { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 @media (max-width: 780px) { .before-after { grid-template-columns: 1fr; } }
 .ba-box { border: 1px solid var(--border); border-radius: 8px; padding: 8px 10px; }
