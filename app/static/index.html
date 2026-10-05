@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>乱序执行轨迹复核器</title>
+<link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+<header class="topbar">
+  <h1>乱序执行轨迹复核器 <span class="sub">ROB · 重命名映射 · 空闲表 · 分支检查点 · 精确异常</span></h1>
+</header>
+
+<main class="layout">
+  <section class="panel input-panel">
+    <div class="panel-head">
+      <h2>输入</h2>
+      <div class="examples">
+        <label for="example-select">示例：</label>
+        <select id="example-select"></select>
+      </div>
+    </div>
+
+    <label for="program-input">指令流（至多 24 条；ADD/SUB/AND/OR/XOR/SLT/MUL Rd,Rs,Rt；BEQ/BNE Rs,Rt predict=taken|not-taken）</label>
+    <textarea id="program-input" spellcheck="false" rows="9"></textarea>
+
+    <label for="events-input">事件序列（至多 96 项；dispatch / writeback / resolve &lt;seq&gt; taken|not-taken / commit [seq] / exception）</label>
+    <textarea id="events-input" spellcheck="false" rows="11"></textarea>
+
+    <div class="controls">
+      <label class="small">物理寄存器数
+        <input id="numphys-input" type="number" min="8" max="128" value="16">
+      </label>
+      <button id="btn-validate" type="button">解析校验</button>
+      <button id="btn-simulate" type="button" class="primary">一次性复核</button>
+      <button id="btn-session" type="button">建立逐步会话</button>
+      <button id="btn-step" type="button" disabled>单步执行</button>
+      <button id="btn-reset" type="button" disabled>复位</button>
+      <span id="parse-status" class="status-line"></span>
+    </div>
+  </section>
+
+  <section class="panel result-panel">
+    <div class="panel-head">
+      <h2>复核结论</h2>
+      <span id="verdict" class="verdict">尚未执行</span>
+      <span id="cursor-info" class="cursor-info"></span>
+    </div>
+
+    <div id="violation-banner" class="violation-banner hidden"></div>
+
+    <div class="result-grid">
+      <div class="col">
+        <h3>事件时间线</h3>
+        <ol id="timeline" class="timeline"></ol>
+      </div>
+      <div class="col col-wide">
+        <div id="detail" class="detail">
+          <p class="placeholder">执行后在此展开首个违规事件（或任一步）前后的映射表、ROB 与回收寄存器证据。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span>初始 R0–R7 → P0–P7，其余物理寄存器由空闲表分配 · 只提交已完成（且已解析）的 ROB 队首</span>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
