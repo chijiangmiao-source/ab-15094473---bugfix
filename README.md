@@ -4,8 +4,10 @@
 **精确异常**都不会让错误路径的寄存器结果进入已提交体系结构状态。
 
 * 纯 Python 标准库实现（无第三方运行时依赖）
-* 维护：ROB 顺序、重命名映射表、空闲物理寄存器表、每个条件分支的检查点
-* 自动定位**首个违规事件**，展开事件前后映射表、ROB、检查点与回收寄存器证据
+* 维护：ROB 顺序、重命名映射表、空闲物理寄存器表、每个条件分支的检查点、
+  同一静态指令的执行世代（重新取回实例与首次执行严格区分）
+* 自动定位**首个违规事件**，展开事件前后映射表、ROB、检查点与回收寄存器证据；
+  被清除实例的世代、映射与物理标签回收依据逐步保留
 * 网页 + REST API（支持一次性复核与逐步真实 API 查看状态）
 * Docker / Compose 一键起页面；`verify` 服务运行构建检查、代码测试与 API/HTTP
   冒烟后以结果码退出
@@ -16,8 +18,12 @@
   （默认 16 个：P8–P15）从空闲表分配。
 * **dispatch（按程序序）**：目的寄存器从空闲表取下一个标签，旧标签记入 ROB；
   源寄存器按**当时映射**读取；条件分支建立检查点（分支本身不占用目的标签）。
-* **writeback**：标记 ROB 项完成；指令一旦被更老分支回滚或异常回滚清除，
-  随后到达的写回一律拒绝（`WRITEBACK_AFTER_SQUASH`）。
+  同一静态指令的每次分派构成一个**执行实例（世代 generation）**：被清除后重新
+  取回的指令是新的实例，页面与证据中以 `#世代` 区分两次执行。
+* **writeback**：按分派先后匹配该静态指令**最老的未完成实例**并标记其 ROB 项
+  完成。属于已被清除实例的迟到写回一律拒绝（`WRITEBACK_AFTER_SQUASH`）——
+  即使该指令已被重新取回，第一次执行遗留的写回也**不能**成为新实例的完成
+  信号；重新取回的执行只有收到属于自身的写回后才能提交。
 * **resolve**：条件分支解析。
   * 预测正确 → 释放该分支检查点；
   * 误预测 → 清除 ROB 中全部更年轻指令、回收其物理标签、映射表/空闲表恢复到
@@ -35,7 +41,7 @@
 | `DISPATCH_OUT_OF_ORDER` / `DISPATCH_DUPLICATE` / `DISPATCH_UNKNOWN_SEQ` | 分派序错误 |
 | `NO_FREE_PHYS_REG` | 空闲物理寄存器耗尽 |
 | `WRITEBACK_NOT_DISPATCHED` / `WRITEBACK_DUPLICATE` | 写回时序错误 |
-| `WRITEBACK_AFTER_SQUASH` | 已被回滚清除的指令写回到达（错误路径结果） |
+| `WRITEBACK_AFTER_SQUASH` | 已被回滚清除的实例写回到达（错误路径结果；含重新取回后前一代遗留的写回） |
 | `RESOLVE_NOT_BRANCH` / `RESOLVE_UNFINISHED` / `RESOLVE_DUPLICATE` / `RESOLVE_STALE` | 分支解析错误 |
 | `COMMIT_EMPTY_ROB` / `COMMIT_NOT_HEAD` / `COMMIT_UNFINISHED` / `COMMIT_UNRESOLVED_BRANCH` | 提交序/完成度违规 |
 | `EXCEPTION_NOT_DISPATCHED` / `EXCEPTION_DUPLICATE` / `EXCEPTION_AFTER_COMMIT` / `EXCEPTION_AFTER_SQUASH` | 异常边界违规 |
@@ -108,7 +114,7 @@ docker compose up --build --abort-on-container-exit verify
 ```bash
 bash scripts/verify.sh                      # 自启临时服务器并冒烟
 TARGET_URL=http://host:port bash scripts/verify.sh
-python3 -m unittest discover -s tests -v    # 仅单元/API 测试（45 项）
+python3 -m unittest discover -s tests -v    # 仅单元/API 测试（58 项）
 python3 scripts/smoke.py http://127.0.0.1:8080
 ```
 

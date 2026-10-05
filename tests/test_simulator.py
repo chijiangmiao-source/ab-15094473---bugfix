@@ -343,6 +343,36 @@ class BranchRollbackTests(unittest.TestCase):
         self.assertTrue(report["ok"], report["violation"])
         self.assertEqual(report["final"]["committed"], [0, 1, 2])
 
+    def test_mispredict_squashing_younger_branch_reclaims_only_real_tags(self):
+        # a younger squashed branch owns no destination tag; the reclaim
+        # evidence must only list real physical tags (regression: sorted()
+        # over None tags crashed the rollback)
+        prog = """
+        ADD R1,R0,R0
+        BEQ R1,R0 predict=taken
+        ADD R2,R1,R0
+        BEQ R2,R1 predict=taken
+        """
+        events = """
+        dispatch I0
+        dispatch I1
+        dispatch I2
+        dispatch I3
+        writeback I0
+        writeback I1
+        commit I0
+        resolve I1 not-taken
+        """
+        report = run(prog, events)
+        self.assertTrue(report["ok"], report["violation"])
+        action = report["steps"][-1]["action"]
+        self.assertEqual([s["seq"] for s in action["squashed"]], [2, 3])
+        self.assertEqual(action["reclaimed_tags"], [9])  # only I2's tag
+        self.assertEqual(report["final"]["squashed"], [2, 3])
+        recs = {r["seq"]: r for r in report["final"]["squashed_instances"]}
+        self.assertIsNone(recs[3]["tag"])                # branch: no tag
+        self.assertEqual(recs[2]["tag"], 9)
+
 
 class ExceptionBoundaryTests(unittest.TestCase):
     def setUp(self):
@@ -467,6 +497,158 @@ class ExceptionBoundaryTests(unittest.TestCase):
                     for m in rb["restored_mappings"]}
         self.assertEqual(restored[(4, 3)], (12, 10))  # I4 tag -> I2 tag
         self.assertEqual(restored[(2, 3)], (10, 3))   # I2 tag -> arch P3
+
+
+class RefetchedInstanceWritebackTests(unittest.TestCase):
+    """A squashed instruction that is re-fetched starts a new execution
+    instance; a leftover writeback of the first execution must never
+    complete the re-fetched one."""
+
+    PROG = """
+    ADD R1,R0,R0
+    BEQ R1,R0 predict=taken
+    ADD R2,R1,R0
+    """
+
+    # dispatch both, mispredict squashes I2 (gen 1), re-dispatch I2 (gen 2)
+    PREFIX = """
+    dispatch I0
+    dispatch I1
+    dispatch I2
+    writeback I0
+    writeback I1
+    commit I0
+    resolve I1 not-taken
+    dispatch I2
+    """
+
+    def test_stale_writeback_of_first_execution_rejected(self):
+        events = self.PREFIX + "\nwriteback I2\ncommit I1\ncommit I2"
+        code, report = violation_code(self.PROG, events)
+        self.assertEqual(code, "WRITEBACK_AFTER_SQUASH")
+        # first violation is located exactly at the late writeback (event 8)
+        self.assertEqual(report["violation_step"], 8)
+        # review stops there: neither the branch nor the re-fetched item commits
+        self.assertEqual(report["final"]["committed"], [0])
+        evidence = report["violation"]["evidence"]
+        # evidence distinguishes the two executions of the same static instr
+        self.assertEqual(evidence["current_generation"], 2)
+        gens = {(i["generation"], i["status"]) for i in evidence["instances"]}
+        self.assertIn((1, "squashed"), gens)
+        self.assertIn((2, "inflight"), gens)
+        self.assertEqual(evidence["live_entry"]["generation"], 2)
+        self.assertFalse(evidence["live_entry"]["done"])
+        squashed = evidence["squashed_instances"]
+        self.assertEqual(len(squashed), 1)
+        self.assertEqual(squashed[0]["generation"], 1)
+        self.assertEqual(squashed[0]["cause"], "mispredict")
+        self.assertEqual(squashed[0]["by_seq"], 1)
+
+    def test_refetched_instance_own_completion_commits(self):
+        # gen 1 receives its own writeback before the squash; the re-fetched
+        # gen 2 then completes from its own writeback and may commit.
+        events = """
+        dispatch I0
+        dispatch I1
+        dispatch I2
+        writeback I0
+        writeback I1
+        writeback I2
+        commit I0
+        resolve I1 not-taken
+        dispatch I2
+        writeback I2
+        commit I1
+        commit I2
+        """
+        report = run(self.PROG, events)
+        self.assertTrue(report["ok"], report["violation"])
+        self.assertEqual(report["final"]["committed"], [0, 1, 2])
+        # the squashed first execution stays on record
+        self.assertEqual(report["final"]["squashed"], [2])
+        recs = report["final"]["squashed_instances"]
+        self.assertEqual([(r["seq"], r["generation"], r["was_done"]) for r in recs],
+                         [(2, 1, True)])
+
+    def test_refetched_instance_without_own_writeback_cannot_commit(self):
+        events = self.PREFIX + "\ncommit I1\ncommit I2"
+        code, report = violation_code(self.PROG, events)
+        self.assertEqual(code, "COMMIT_UNFINISHED")
+        self.assertEqual(report["violation_step"], 9)
+
+    def test_generations_and_refetch_marked_on_dispatch(self):
+        report = run(self.PROG, self.PREFIX)
+        self.assertTrue(report["ok"], report["violation"])
+        first, second = report["steps"][2], report["steps"][7]
+        self.assertEqual(first["action"]["generation"], 1)
+        self.assertFalse(first["action"]["refetched"])
+        self.assertEqual(second["action"]["generation"], 2)
+        self.assertTrue(second["action"]["refetched"])
+        self.assertEqual(second["action"]["squashed_generations"], [1])
+        rob = second["after"]["rob"]
+        self.assertEqual([e["generation"] for e in rob], [1, 2])
+        self.assertEqual(second["after"]["dispatch_generations"], {"0": 1, "1": 1, "2": 2})
+
+    def test_squash_preserves_mapping_and_reclaim_evidence(self):
+        report = run(self.PROG, self.PREFIX)
+        resolve_step = report["steps"][6]
+        action = resolve_step["action"]
+        self.assertTrue(action["mispredicted"])
+        self.assertEqual(action["squashed"][0]["generation"], 1)
+        self.assertEqual(action["squashed"][0]["tag"], 9)     # gen1 R2 -> P9
+        self.assertEqual(action["squashed"][0]["old_tag"], 2)
+        self.assertIn(9, resolve_step["after"]["free_list"])  # tag reclaimed
+        # re-dispatch re-allocates the reclaimed tag for generation 2
+        self.assertEqual(report["steps"][7]["action"]["tag"], 9)
+        # snapshot keeps the per-instance reclaim evidence for the page
+        recs = report["steps"][7]["after"]["squashed_instances"]
+        self.assertEqual(len(recs), 1)
+        self.assertEqual((recs[0]["seq"], recs[0]["generation"],
+                          recs[0]["tag"], recs[0]["old_tag"]), (2, 1, 9, 2))
+
+    def test_completed_then_squashed_late_writeback_still_rejected(self):
+        # ordinary boundary: gen 1 wrote back, then got squashed, and was
+        # never re-fetched — a further writeback stays WRITEBACK_AFTER_SQUASH
+        events = """
+        dispatch I0
+        dispatch I1
+        dispatch I2
+        writeback I0
+        writeback I1
+        writeback I2
+        commit I0
+        resolve I1 not-taken
+        writeback I2
+        """
+        code, report = violation_code(self.PROG, events)
+        self.assertEqual(code, "WRITEBACK_AFTER_SQUASH")
+        self.assertEqual(report["violation_step"], 8)
+
+    def test_exception_on_refetched_instance_still_precise(self):
+        # a re-fetched generation may itself fault; the earlier squashed
+        # generation must not turn that into EXCEPTION_AFTER_SQUASH
+        events = """
+        dispatch I0
+        dispatch I1
+        dispatch I2
+        writeback I0
+        writeback I1
+        writeback I2
+        commit I0
+        resolve I1 not-taken
+        dispatch I2
+        exception I2
+        commit I1
+        """
+        report = run(self.PROG, events)
+        self.assertTrue(report["ok"], report["violation"])
+        rb = report["rollback_log"][-1]
+        self.assertEqual(rb["fault_seq"], 2)
+        self.assertEqual(rb["discarded"][0]["generation"], 2)
+        # precise state: only I0 (R1 -> P8) survives; R2 back to P2
+        self.assertEqual(rb["precise_map"][1], 8)
+        self.assertEqual(rb["precise_map"][2], 2)
+        self.assertEqual(report["final"]["committed"], [0, 1])
 
 
 class IncrementalSimulatorTests(unittest.TestCase):

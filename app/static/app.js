@@ -53,6 +53,47 @@ const EXAMPLES = {
       "writeback I3"
     ].join("\n")
   },
+  "违规：重取后旧写回迟到": {
+    program: [
+      "ADD R1,R0,R0",
+      "BEQ R1,R0 predict=taken",
+      "ADD R2,R1,R0"
+    ].join("\n"),
+    events: [
+      "dispatch I0",
+      "dispatch I1",
+      "dispatch I2",
+      "writeback I0",
+      "writeback I1",
+      "commit I0",
+      "resolve I1 not-taken",
+      "dispatch I2",
+      "writeback I2",
+      "commit I1",
+      "commit I2"
+    ].join("\n")
+  },
+  "重取实例自身完成（正确轨迹）": {
+    program: [
+      "ADD R1,R0,R0",
+      "BEQ R1,R0 predict=taken",
+      "ADD R2,R1,R0"
+    ].join("\n"),
+    events: [
+      "dispatch I0",
+      "dispatch I1",
+      "dispatch I2",
+      "writeback I0",
+      "writeback I1",
+      "writeback I2",
+      "commit I0",
+      "resolve I1 not-taken",
+      "dispatch I2",
+      "writeback I2",
+      "commit I1",
+      "commit I2"
+    ].join("\n")
+  },
   "异常精确回滚（正确轨迹）": {
     program: [
       "ADD R1,R0,R0",
@@ -231,6 +272,18 @@ function renderReport(report) {
   }
 }
 
+function stepLabel(step) {
+  let label = step.description;
+  const a = step.action;
+  if (a && a.action === "dispatch" && a.generation) {
+    label += a.refetched ? `（重取 #${a.generation}）` : (a.generation > 1 ? `（#${a.generation}）` : "");
+  }
+  if (a && a.action === "writeback" && a.generation > 1) {
+    label += `（#${a.generation}）`;
+  }
+  return label;
+}
+
 function renderTimeline(totalEvents) {
   els.timeline.innerHTML = "";
   for (let i = 0; i < totalEvents; i++) {
@@ -239,8 +292,8 @@ function renderTimeline(totalEvents) {
     let cls = "pending";
     let label = "待执行";
     if (step) {
-      if (step.violation) { cls = "bad"; label = step.description; }
-      else { cls = "ok"; label = step.description; }
+      if (step.violation) { cls = "bad"; label = stepLabel(step); }
+      else { cls = "ok"; label = stepLabel(step); }
     } else {
       label = `事件 #${i} 未执行`;
     }
@@ -323,8 +376,11 @@ function robCards(snap) {
       flags.push(`<span class="flag ${e.resolved ? "resolved" : "off"}">RS${e.resolved ? (e.taken ? "=T" : "=NT") : ""}</span>`);
     }
     if (e.has_exception) flags.push('<span class="flag on" style="color:var(--bad)">EXC</span>');
+    const gen = e.generation > 1
+      ? ` <span class="gen" title="第 ${e.generation} 次执行（重新取回）">#${e.generation} 重取</span>`
+      : ` <span class="gen gen-first">#${e.generation || 1}</span>`;
     card.innerHTML =
-      `<div class="t">${idx === 0 ? "▶ " : ""}I${e.seq} ${escapeHtml(e.name)}</div>
+      `<div class="t">${idx === 0 ? "▶ " : ""}I${e.seq}${gen} ${escapeHtml(e.name)}</div>
        <div class="meta">tag=P${e.tag}${e.old_tag !== null ? ` old=P${e.old_tag}` : ""}</div>
        <div class="flags">${flags.join("")}</div>`;
     wrap.appendChild(card);
@@ -374,13 +430,26 @@ function renderStepDetail(step) {
   if (action && action.action === "dispatch") {
     const ev = document.createElement("div");
     ev.className = "evidence";
+    const genLine = action.refetched
+      ? `<li>第 <strong>${action.generation}</strong> 次执行：<strong>重新取回</strong>——先前实例（${(action.squashed_generations || []).map(g => `#${g}`).join("、") || "?"}）已被清除；本实例只有收到属于自身的写回后才能完成</li>`
+      : `<li>第 ${action.generation || 1} 次执行</li>`;
     ev.innerHTML =
       `<h4>分派证据</h4>
        <ul>
+         ${genLine}
          <li>目的物理标签：新分配 <span class="tag">P${action.tag}</span>${action.old_tag !== null ? `，旧标签 <span class="tag-old">P${action.old_tag}</span>（记入 ROB，提交时回收）` : "（分支，不分配标签）"}</li>
          <li>源操作数按当时映射读取：${action.src_tags.map((t, i) => `Rs${i}=<span class="tag">P${t}</span>`).join("，")}</li>
          ${action.checkpoint ? `<li>建立分支检查点：map=[${action.checkpoint.map_table.map(p => "P" + p).join(",")}]，free=[${action.checkpoint.free_list.map(p => "P" + p).join(",")}]</li>` : ""}
        </ul>`;
+    frag.appendChild(ev);
+  }
+
+  if (action && action.action === "writeback") {
+    const ev = document.createElement("div");
+    ev.className = "evidence";
+    ev.innerHTML =
+      `<h4>写回证据</h4>
+       <ul><li>完成 I${action.seq} 的第 ${action.generation || 1} 次执行（标签 <span class="tag">P${action.tag}</span>）</li></ul>`;
     frag.appendChild(ev);
   }
 
@@ -434,6 +503,9 @@ function renderStepDetail(step) {
   frag.appendChild(h3("ROB（事件后）"));
   frag.appendChild(robCards(after));
 
+  frag.appendChild(h3("已清除实例（累计，含映射与回收依据）"));
+  frag.appendChild(squashedInstanceCards(after));
+
   const freeRow = document.createElement("div");
   freeRow.className = "before-after";
   const fl = document.createElement("div");
@@ -467,7 +539,7 @@ function renderRollbackEvidence(a) {
   const ev = document.createElement("div");
   ev.className = "evidence";
   const squashed = a.squashed.map(s =>
-    `I${s.seq}(tag P${s.tag}${s.was_done ? "，已写回" : ""})`).join("、") || "无";
+    `I${s.seq}#${s.generation || 1}(${s.tag !== null && s.tag !== undefined ? `tag P${s.tag}` : "分支，无标签"}${s.was_done ? "，已写回" : ""})`).join("、") || "无";
   ev.innerHTML =
     `<h4>误预测回滚证据 — 分支 I${a.seq}（预测 ${a.predicted_taken ? "taken" : "not-taken"}，实际 ${a.taken ? "taken" : "not-taken"}）</h4>
      <ul>
@@ -484,7 +556,7 @@ function renderExceptionEvidence(r) {
   ev.className = "evidence";
   ev.style.borderColor = "#933";
   const discarded = r.discarded.map(d =>
-    `I${d.seq}${d.is_faulting ? "（异常自身）" : ""}(P${d.tag}${d.was_done ? "，已写回" : ""})`).join("、");
+    `I${d.seq}#${d.generation || 1}${d.is_faulting ? "（异常自身）" : ""}(${d.tag !== null && d.tag !== undefined ? `P${d.tag}` : "分支，无标签"}${d.was_done ? "，已写回" : ""})`).join("、");
   ev.innerHTML =
     `<h4 style="color:#ff8b8b">精确异常证据 — 故障指令 I${r.fault_seq} 到达 ROB 队首</h4>
      <ul>
@@ -495,6 +567,28 @@ function renderExceptionEvidence(r) {
        <li>异常前精确映射：[${r.precise_map.map(p => "P" + p).join(",")}]</li>
      </ul>`;
   return ev;
+}
+
+function squashedInstanceCards(snap) {
+  const wrap = document.createElement("div");
+  wrap.className = "rob-list";
+  const recs = snap.squashed_instances || [];
+  if (!recs.length) {
+    wrap.innerHTML = '<span class="chip">无被清除实例</span>';
+    return wrap;
+  }
+  for (const r of recs) {
+    const card = document.createElement("div");
+    card.className = "rob-card squashed-card";
+    const cause = r.cause === "exception"
+      ? `异常回滚（故障 I${r.by_seq}）` : `误预测回滚（分支 I${r.by_seq}）`;
+    card.innerHTML =
+      `<div class="t">I${r.seq} <span class="gen">#${r.generation}</span>${r.is_faulting ? ' <span class="flag on" style="color:var(--bad)">EXC</span>' : ""}</div>
+       <div class="meta">${r.dest !== null && r.dest !== undefined ? `R${r.dest}: tag=P${r.tag} old=P${r.old_tag}` : "（分支，无目的标签）"}${r.was_done ? " · 已写回" : " · 未写回"}</div>
+       <div class="meta">${escapeHtml(cause)}</div>`;
+    wrap.appendChild(card);
+  }
+  return wrap;
 }
 
 function escapeHtml(s) {

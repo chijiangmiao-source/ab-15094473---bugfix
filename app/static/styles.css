@@ -200,6 +200,16 @@ table.state tr.section td { background: #121a2c; color: #9db1dd; text-align: lef
 }
 .rob-card.head { border-color: var(--accent); }
 .rob-card.exc { border-color: var(--bad); background: var(--bad-bg); }
+.rob-card.squashed-card { border-style: dashed; opacity: 0.85; }
+.rob-card .gen {
+  color: var(--warn);
+  font-size: 10.5px;
+  border: 1px solid #7a5a1e;
+  border-radius: 8px;
+  padding: 0 5px;
+  margin-left: 4px;
+}
+.rob-card .gen.gen-first { color: var(--muted); border-color: var(--border); }
 .rob-card .t { font-weight: bold; }
 .rob-card .meta { color: var(--muted); margin-top: 3px; }
 .rob-card .flags { margin-top: 4px; }

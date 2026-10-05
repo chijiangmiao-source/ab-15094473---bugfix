@@ -35,6 +35,46 @@ resolve I2 not-taken
 
 EVENTS_BAD = EVENTS_OK + "\nwriteback I3"  # I3 squashed: late writeback rejected
 
+# A conditional branch followed by a register-writing ALU instruction:
+# the branch resolves against its prediction and squashes the younger I2
+# (generation 1); I2 is then re-fetched (generation 2) and the leftover
+# writeback of the first execution arrives — it must be rejected, and the
+# re-fetched execution may only commit after its own completion event.
+PROG_REFETCH = """
+ADD R1,R0,R0
+BEQ R1,R0 predict=taken
+ADD R2,R1,R0
+"""
+
+EVENTS_REFETCH_STALE = """
+dispatch I0
+dispatch I1
+dispatch I2
+writeback I0
+writeback I1
+commit I0
+resolve I1 not-taken
+dispatch I2
+writeback I2
+commit I1
+commit I2
+"""
+
+EVENTS_REFETCH_OWN_COMPLETION = """
+dispatch I0
+dispatch I1
+dispatch I2
+writeback I0
+writeback I1
+writeback I2
+commit I0
+resolve I1 not-taken
+dispatch I2
+writeback I2
+commit I1
+commit I2
+"""
+
 
 class ServerHarness:
     def __init__(self):
@@ -139,6 +179,65 @@ class HttpApiTests(unittest.TestCase):
     def test_unknown_session_404(self):
         with ServerHarness() as h:
             h.request("/api/sessions/nope/step", "POST", expect_status=404)
+
+    def test_simulate_rejects_stale_writeback_of_squashed_generation(self):
+        with ServerHarness() as h:
+            status, body = h.request(
+                "/api/simulate", "POST",
+                {"program": PROG_REFETCH, "events": EVENTS_REFETCH_STALE}, 200)
+            self.assertFalse(body["ok"])
+            self.assertEqual(body["violation"]["code"], "WRITEBACK_AFTER_SQUASH")
+            # first violation is the late writeback of generation 1 (event 8)
+            self.assertEqual(body["violation_step"], 8)
+            ev = body["violation"]["evidence"]
+            self.assertEqual(ev["current_generation"], 2)
+            gens = {(i["generation"], i["status"]) for i in ev["instances"]}
+            self.assertIn((1, "squashed"), gens)
+            self.assertIn((2, "inflight"), gens)
+            # branch and re-fetched item never commit
+            self.assertEqual(body["final"]["committed"], [0])
+
+    def test_simulate_refetched_own_completion_legal(self):
+        with ServerHarness() as h:
+            status, body = h.request(
+                "/api/simulate", "POST",
+                {"program": PROG_REFETCH, "events": EVENTS_REFETCH_OWN_COMPLETION}, 200)
+            self.assertTrue(body["ok"], body["violation"])
+            self.assertEqual(body["final"]["committed"], [0, 1, 2])
+            recs = body["final"]["squashed_instances"]
+            self.assertEqual([(r["seq"], r["generation"]) for r in recs], [(2, 1)])
+
+    def test_session_distinguishes_executions_step_by_step(self):
+        with ServerHarness() as h:
+            status, s = h.request(
+                "/api/sessions", "POST",
+                {"program": PROG_REFETCH, "events": EVENTS_REFETCH_STALE}, 201)
+            sid = s["id"]
+            # step through dispatch/mispredict/refetch: all legal so far
+            for _ in range(8):
+                status, r = h.request(f"/api/sessions/{sid}/step", "POST",
+                                      expect_status=200)
+                self.assertIsNone(r["state"]["violation"])
+            # the re-dispatch step is marked as generation 2 (refetch)
+            refetch_step = r["state"]["steps"][7]
+            self.assertEqual(refetch_step["action"]["generation"], 2)
+            self.assertTrue(refetch_step["action"]["refetched"])
+            # the squashed generation-1 instance is preserved with its
+            # mapping / tag reclaim evidence
+            recs = refetch_step["after"]["squashed_instances"]
+            self.assertEqual(len(recs), 1)
+            self.assertEqual((recs[0]["seq"], recs[0]["generation"],
+                              recs[0]["tag"], recs[0]["old_tag"]), (2, 1, 9, 2))
+            # ROB shows the live generation-2 entry, not yet complete
+            self.assertEqual([e["generation"] for e in refetch_step["after"]["rob"]], [1, 2])
+            # the stale writeback of generation 1 is rejected at event 8
+            status, r = h.request(f"/api/sessions/{sid}/step", "POST",
+                                  expect_status=200)
+            st = r["state"]
+            self.assertEqual(st["violation"]["code"], "WRITEBACK_AFTER_SQUASH")
+            self.assertEqual(st["violation"]["evidence"]["current_generation"], 2)
+            self.assertTrue(st["done"])
+            self.assertEqual(st["current"]["committed"], [0])
 
 
 if __name__ == "__main__":

@@ -7,8 +7,14 @@ Models a checkpoint-based rename / ROB machine:
   P0..P7; additional physical registers are allocatable from a free list.
 * in-order dispatch renames the destination, records the previous mapping
   (old tag) in the ROB, and snapshots a per-conditional-branch checkpoint.
-* writeback marks the ROB entry complete; a writeback that arrives after the
-  instruction was squashed is a violation.
+  Every dispatch of a static instruction creates a new execution instance
+  (generation); a re-fetch after a squash starts the next generation.
+* writeback completes the oldest execution instance of the static
+  instruction that has not yet received a completion. A writeback that
+  belongs to an already-squashed instance — including a leftover writeback
+  from a first execution that arrives after the instruction was re-fetched —
+  is a violation: the re-fetched execution may only complete from its own
+  writeback.
 * resolve on a conditional branch: on a misprediction every younger ROB
   entry is squashed and the map / free list are restored from that branch's
   checkpoint; a correctly predicted branch simply retires its checkpoint.
@@ -286,7 +292,13 @@ class Simulator:
         self.checkpoints: dict[int, dict] = {}           # branch seq -> checkpoint
         self.next_dispatch = 0
         self.committed = []
-        self.squashed = set()
+        self.squashed = set()                # seqs with at least one squashed instance
+        # Per static instruction, every dispatch spawns one execution instance
+        # (generation). Writebacks are matched to instances oldest-first, so a
+        # leftover writeback of a squashed generation can never complete the
+        # re-fetched generation.
+        self.instances: dict[int, list[dict]] = {}       # seq -> [instance]
+        self.squash_log = []                 # per-instance squash evidence
         self.counters = {
             "dispatch": 0,
             "writeback": 0,
@@ -309,6 +321,7 @@ class Simulator:
             "rob": [e.to_dict() for e in self.rob],
             "committed": list(self.committed),
             "squashed": sorted(self.squashed),
+            "squashed_instances": [dict(rec) for rec in self.squash_log],
             "checkpoints": {
                 str(seq): {
                     "map_table": list(cp["map_table"]),
@@ -329,6 +342,34 @@ class Simulator:
         if entry is not None and entry in self.rob:
             return entry
         return None
+
+    def _instance_of(self, entry: RobEntry) -> Optional[dict]:
+        for inst in self.instances.get(entry.seq, []):
+            if inst["generation"] == entry.generation:
+                return inst
+        return None
+
+    def _record_squash(self, entry: RobEntry, cause: str, by_seq: int,
+                       is_faulting: bool = False) -> dict:
+        """Mark the entry's execution instance squashed and keep the
+        per-instance reclaim evidence (tag / old tag / dest / completion)."""
+        inst = self._instance_of(entry)
+        if inst is not None:
+            inst["status"] = "squashed"
+        self.squashed.add(entry.seq)
+        record = {
+            "seq": entry.seq,
+            "generation": entry.generation,
+            "tag": entry.tag,
+            "old_tag": entry.old_tag,
+            "dest": entry.instr.dest,
+            "was_done": entry.done,
+            "cause": cause,
+            "by_seq": by_seq,
+            "is_faulting": is_faulting,
+        }
+        self.squash_log.append(record)
+        return record
 
     # -- event application --------------------------------------------------
 
@@ -371,8 +412,13 @@ class Simulator:
 
         instr = self.instructions[seq]
         generation = self.dispatch_generations.get(seq, 0) + 1
-        if refetching:
-            self.squashed.remove(seq)
+        # A re-fetched instruction keeps its earlier squashed generations on
+        # record: a leftover writeback of such a generation must still be
+        # rejected instead of completing this new execution.
+        squashed_generations = [
+            inst["generation"] for inst in self.instances.get(seq, [])
+            if inst["status"] == "squashed"
+        ]
 
         # Only instructions that write an architectural register rename a
         # destination tag; branches consume no free-list entry.
@@ -399,6 +445,14 @@ class Simulator:
         self.rob.append(entry)
         self.by_seq[seq] = entry
         self.dispatch_generations[seq] = generation
+        self.instances.setdefault(seq, []).append({
+            "generation": generation,
+            "status": "inflight",
+            "wb_matched": False,
+            "tag": tag,
+            "old_tag": old_tag,
+            "dest": instr.dest,
+        })
         if instr.dest is not None:
             self.map_table[instr.dest] = tag
         if not refetching:
@@ -409,6 +463,7 @@ class Simulator:
             "seq": seq,
             "generation": generation,
             "refetched": refetching,
+            "squashed_generations": squashed_generations,
             "tag": tag,
             "old_tag": old_tag,
             "src_tags": src_tags,
@@ -419,27 +474,58 @@ class Simulator:
         seq = ev.seq
         if seq is None or not 0 <= seq < len(self.instructions):
             raise Violation("WRITEBACK_UNKNOWN_SEQ", f"writeback refers to unknown I{seq}")
-        if seq in self.squashed:
+        insts = self.instances.get(seq, [])
+        # A writeback completes the oldest execution instance of this static
+        # instruction that has not yet received its completion event.
+        pending = next((inst for inst in insts if not inst["wb_matched"]), None)
+        if pending is None:
+            if not insts:
+                raise Violation(
+                    "WRITEBACK_NOT_DISPATCHED",
+                    f"writeback for I{seq} before it was dispatched",
+                )
+            if seq in self.committed:
+                raise Violation("WRITEBACK_AFTER_COMMIT", f"I{seq} already committed")
+            if any(inst["status"] == "squashed" for inst in insts):
+                raise Violation(
+                    "WRITEBACK_AFTER_SQUASH",
+                    f"writeback for I{seq} rejected: its execution was already "
+                    f"squashed by an older resolved branch or precise-exception "
+                    f"rollback; its result must never reach committed "
+                    f"architectural state",
+                    self._squash_evidence(seq),
+                )
+            raise Violation("WRITEBACK_DUPLICATE", f"I{seq} already wrote back")
+        if pending["status"] == "squashed":
+            current = self.dispatch_generations.get(seq)
             raise Violation(
                 "WRITEBACK_AFTER_SQUASH",
-                f"writeback for I{seq} rejected: instruction was already squashed by an "
-                f"older resolved branch or precise-exception rollback; its result must "
-                f"never reach committed architectural state",
+                f"writeback for I{seq} rejected: it belongs to execution "
+                f"#{pending['generation']}, which was already squashed by an older "
+                f"resolved branch or precise-exception rollback; its result must "
+                f"never reach committed architectural state"
+                + (
+                    f" — the re-fetched execution #{current} may only complete "
+                    f"from its own writeback"
+                    if current != pending["generation"] else ""
+                ),
                 self._squash_evidence(seq),
             )
-        if seq in self.committed:
-            raise Violation("WRITEBACK_AFTER_COMMIT", f"I{seq} already committed")
         entry = self._lookup(seq)
-        if entry is None:
-            raise Violation(
+        if entry is None or entry.generation != pending["generation"]:
+            raise Violation(  # defensive: an in-flight instance is always in the ROB
                 "WRITEBACK_NOT_DISPATCHED",
                 f"writeback for I{seq} before it was dispatched",
             )
-        if entry.done:
-            raise Violation("WRITEBACK_DUPLICATE", f"I{seq} already wrote back")
+        pending["wb_matched"] = True
         entry.done = True
         self.counters["writeback"] += 1
-        return {"action": "writeback", "seq": seq, "tag": entry.tag}
+        return {
+            "action": "writeback",
+            "seq": seq,
+            "generation": entry.generation,
+            "tag": entry.tag,
+        }
 
     def _do_resolve(self, ev: Event) -> dict:
         seq = ev.seq
@@ -487,11 +573,7 @@ class Simulator:
         younger = [e for e in self.rob if e.seq > seq]
         squashed_records = []
         for e in younger:
-            squashed_records.append(
-                {"seq": e.seq, "tag": e.tag, "old_tag": e.old_tag, "dest": e.instr.dest,
-                 "was_done": e.done}
-            )
-            self.squashed.add(e.seq)
+            squashed_records.append(self._record_squash(e, "mispredict", seq))
             self.rob.remove(e)
             self.by_seq.pop(e.seq, None)
             self.checkpoints.pop(e.seq, None)
@@ -501,7 +583,8 @@ class Simulator:
             for r in range(ARCH_REGS)
             if self.map_table[r] != cp["map_table"][r]
         ]
-        reclaimed = sorted(e["tag"] for e in squashed_records)
+        reclaimed = sorted(e["tag"] for e in squashed_records
+                           if e["tag"] is not None)
         before_map, before_free = list(self.map_table), sorted(self.free_list)
         self.map_table = list(cp["map_table"])
         self.free_list = sorted(cp["free_list"])
@@ -558,6 +641,9 @@ class Simulator:
         self.rob.pop(0)
         self.by_seq.pop(head.seq, None)
         self.committed.append(head.seq)
+        inst = self._instance_of(head)
+        if inst is not None:
+            inst["status"] = "committed"
         self.counters["commit"] += 1
         reclaimed_old = None
         if head.old_tag is not None:
@@ -578,21 +664,21 @@ class Simulator:
         seq = ev.seq
         if seq is None or not 0 <= seq < len(self.instructions):
             raise Violation("EXCEPTION_UNKNOWN_SEQ", f"exception refers to unknown I{seq}")
-        if seq in self.committed:
-            raise Violation(
-                "EXCEPTION_AFTER_COMMIT",
-                f"exception for I{seq} arrives after commit: architectural state already "
-                f"contains the faulting result — precise exception is impossible",
-                {"committed": list(self.committed)},
-            )
-        if seq in self.squashed:
-            raise Violation(
-                "EXCEPTION_AFTER_SQUASH",
-                f"exception for I{seq} but the instruction was already squashed",
-                self._squash_evidence(seq),
-            )
         entry = self._lookup(seq)
         if entry is None:
+            if seq in self.committed:
+                raise Violation(
+                    "EXCEPTION_AFTER_COMMIT",
+                    f"exception for I{seq} arrives after commit: architectural state already "
+                    f"contains the faulting result — precise exception is impossible",
+                    {"committed": list(self.committed)},
+                )
+            if seq in self.squashed:
+                raise Violation(
+                    "EXCEPTION_AFTER_SQUASH",
+                    f"exception for I{seq} but the instruction was already squashed",
+                    self._squash_evidence(seq),
+                )
             raise Violation(
                 "EXCEPTION_NOT_DISPATCHED",
                 f"exception for I{seq} before it was dispatched",
@@ -625,25 +711,22 @@ class Simulator:
             if e.instr.dest is not None and self.map_table[e.instr.dest] == e.tag:
                 restored.append(
                     {"arch": e.instr.dest, "from": e.tag, "to": e.old_tag,
-                     "seq": e.seq}
+                     "seq": e.seq, "generation": e.generation}
                 )
                 self.map_table[e.instr.dest] = e.old_tag
             if e.instr.dest is not None:
                 self.free_list.append(e.tag)
-            reclaimed.append(e.tag)
+                reclaimed.append(e.tag)
             discarded.append(
-                {"seq": e.seq, "tag": e.tag, "old_tag": e.old_tag,
-                 "dest": e.instr.dest, "was_done": e.done,
-                 "is_faulting": e.seq == fault.seq}
+                self._record_squash(e, "exception", fault.seq,
+                                    is_faulting=e.seq == fault.seq)
             )
 
         for e in reversed(everyone[1:]):
             rollback_entry(e)
-            self.squashed.add(e.seq)
             self.by_seq.pop(e.seq, None)
             self.checkpoints.pop(e.seq, None)
         rollback_entry(fault)
-        self.squashed.add(fault.seq)
         self.by_seq.pop(fault.seq, None)
         self.checkpoints.pop(fault.seq, None)
         self.rob = []
@@ -661,11 +744,23 @@ class Simulator:
         return record
 
     def _squash_evidence(self, seq) -> dict:
+        insts = self.instances.get(seq, [])
+        live = self._lookup(seq)
         return {
             "seq": seq,
             "squashed": sorted(self.squashed),
             "committed": list(self.committed),
             "rob_head": self.rob[0].seq if self.rob else None,
+            "current_generation": self.dispatch_generations.get(seq),
+            "instances": [
+                {"generation": inst["generation"], "status": inst["status"],
+                 "wb_matched": inst["wb_matched"], "tag": inst["tag"]}
+                for inst in insts
+            ],
+            "live_entry": live.to_dict() if live is not None else None,
+            "squashed_instances": [
+                dict(rec) for rec in self.squash_log if rec["seq"] == seq
+            ],
         }
 
     def _exception_evidence(self, entry) -> dict:
@@ -726,6 +821,7 @@ class Simulator:
             "final": self.snapshot(),
             "counters": dict(self.counters),
             "rollback_log": self.rollback_log,
+            "squash_log": [dict(rec) for rec in self.squash_log],
             "instructions": [
                 {"seq": i.seq, "text": i.text, "name": i.name, "op": i.op,
                  "dest": i.dest, "srcs": i.srcs, "is_branch": i.is_branch,
